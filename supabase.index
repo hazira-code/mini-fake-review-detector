@@ -1,0 +1,337 @@
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+};
+
+const STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he",
+  "in", "is", "it", "its", "of", "on", "that", "the", "to", "was", "were",
+  "will", "with", "i", "you", "this", "but", "they", "have", "had", "what",
+  "when", "can", "or", "who", "get", "if", "would", "her", "all", "my", "me",
+]);
+
+const FAKE_INDICATORS = [
+  "amazing", "perfect", "best", "worst", "terrible", "awful", "incredible",
+  "fantastic", "excellent", "outstanding", "highly recommend", "must buy",
+  "changed my life", "game changer", "waste of money", "don't buy",
+];
+
+interface FeatureVector {
+  reviewLength: number;
+  avgWordLength: number;
+  exclamationCount: number;
+  capsRatio: number;
+  sentimentScore: number;
+  repetitionScore: number;
+  fakeWordCount: number;
+  uniqueWordRatio: number;
+  sentenceCount: number;
+  questionMarkCount: number;
+}
+
+interface AnalysisResult {
+  verdict: "fake" | "genuine";
+  confidence_score: number;
+  indicators: string[];
+  features: FeatureVector;
+}
+
+class TextPreprocessor {
+  static tokenize(text: string): string[] {
+    return text
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 0);
+  }
+
+  static removeStopwords(tokens: string[]): string[] {
+    return tokens.filter((token) => !STOPWORDS.has(token));
+  }
+
+  static stem(word: string): string {
+    if (word.length < 4) return word;
+
+    if (word.endsWith("ing")) return word.slice(0, -3);
+    if (word.endsWith("ed")) return word.slice(0, -2);
+    if (word.endsWith("ly")) return word.slice(0, -2);
+    if (word.endsWith("ness")) return word.slice(0, -4);
+    if (word.endsWith("ment")) return word.slice(0, -4);
+    if (word.endsWith("ous")) return word.slice(0, -3);
+    if (word.endsWith("ive")) return word.slice(0, -3);
+    if (word.endsWith("ful")) return word.slice(0, -3);
+
+    return word;
+  }
+
+  static preprocess(text: string): string[] {
+    const tokens = this.tokenize(text);
+    const withoutStopwords = this.removeStopwords(tokens);
+    return withoutStopwords.map((token) => this.stem(token));
+  }
+}
+
+class FeatureExtractor {
+  static extractFeatures(text: string): FeatureVector {
+    const tokens = TextPreprocessor.tokenize(text);
+    const words = tokens.filter((t) => t.length > 0);
+
+    const reviewLength = text.length;
+    const avgWordLength = words.length > 0 ? words.reduce((sum, w) => sum + w.length, 0) / words.length : 0;
+    const exclamationCount = (text.match(/!/g) || []).length;
+    const questionMarkCount = (text.match(/\?/g) || []).length;
+    const capsCount = (text.match(/[A-Z]/g) || []).length;
+    const capsRatio = text.length > 0 ? capsCount / text.length : 0;
+
+    const sentimentScore = this.calculateSentiment(text.toLowerCase());
+    const repetitionScore = this.calculateRepetition(words);
+    const fakeWordCount = this.countFakeIndicators(text.toLowerCase());
+
+    const uniqueWords = new Set(words);
+    const uniqueWordRatio = words.length > 0 ? uniqueWords.size / words.length : 0;
+
+    const sentenceCount = text.split(/[.!?]+/).filter((s) => s.trim().length > 0).length;
+
+    return {
+      reviewLength,
+      avgWordLength,
+      exclamationCount,
+      capsRatio,
+      sentimentScore,
+      repetitionScore,
+      fakeWordCount,
+      uniqueWordRatio,
+      sentenceCount,
+      questionMarkCount,
+    };
+  }
+
+  static calculateSentiment(text: string): number {
+    const positiveWords = [
+      "good", "great", "excellent", "amazing", "wonderful", "fantastic",
+      "best", "love", "perfect", "awesome", "brilliant", "outstanding",
+    ];
+    const negativeWords = [
+      "bad", "terrible", "awful", "worst", "horrible", "poor", "disappointing",
+      "waste", "useless", "defective", "broken", "damaged",
+    ];
+
+    let score = 0;
+    const words = text.split(/\s+/);
+
+    for (const word of words) {
+      if (positiveWords.includes(word)) score += 1;
+      if (negativeWords.includes(word)) score -= 1;
+    }
+
+    return words.length > 0 ? score / words.length : 0;
+  }
+
+  static calculateRepetition(words: string[]): number {
+    if (words.length === 0) return 0;
+
+    const wordCounts = new Map<string, number>();
+    for (const word of words) {
+      wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
+    }
+
+    let maxRepeat = 0;
+    for (const count of wordCounts.values()) {
+      if (count > maxRepeat) maxRepeat = count;
+    }
+
+    return maxRepeat / words.length;
+  }
+
+  static countFakeIndicators(text: string): number {
+    let count = 0;
+    for (const indicator of FAKE_INDICATORS) {
+      if (text.includes(indicator)) count++;
+    }
+    return count;
+  }
+}
+
+class FakeReviewClassifier {
+  private weights = {
+    reviewLength: -0.0008,
+    avgWordLength: 0.15,
+    exclamationCount: 0.25,
+    capsRatio: 1.8,
+    sentimentScore: 0.95,
+    repetitionScore: 2.1,
+    fakeWordCount: 0.35,
+    uniqueWordRatio: -1.2,
+    sentenceCount: -0.05,
+    questionMarkCount: 0.15,
+    bias: -0.3,
+  };
+
+  predict(features: FeatureVector): { verdict: "fake" | "genuine"; confidence: number } {
+    const score =
+      features.reviewLength * this.weights.reviewLength +
+      features.avgWordLength * this.weights.avgWordLength +
+      features.exclamationCount * this.weights.exclamationCount +
+      features.capsRatio * this.weights.capsRatio +
+      features.sentimentScore * this.weights.sentimentScore +
+      features.repetitionScore * this.weights.repetitionScore +
+      features.fakeWordCount * this.weights.fakeWordCount +
+      features.uniqueWordRatio * this.weights.uniqueWordRatio +
+      features.sentenceCount * this.weights.sentenceCount +
+      features.questionMarkCount * this.weights.questionMarkCount +
+      this.weights.bias;
+
+    const probability = 1 / (1 + Math.exp(-score));
+
+    const verdict = probability > 0.5 ? "fake" : "genuine";
+    const confidence = verdict === "fake" ? probability : 1 - probability;
+
+    return { verdict, confidence };
+  }
+
+  explainPrediction(features: FeatureVector, text: string): string[] {
+    const indicators: string[] = [];
+
+    if (features.exclamationCount > 3) {
+      indicators.push("Excessive use of exclamation marks");
+    }
+
+    if (features.capsRatio > 0.15) {
+      indicators.push("Unusual amount of capital letters");
+    }
+
+    if (Math.abs(features.sentimentScore) > 0.15) {
+      if (features.sentimentScore > 0) {
+        indicators.push("Extremely positive sentiment");
+      } else {
+        indicators.push("Extremely negative sentiment");
+      }
+    }
+
+    if (features.repetitionScore > 0.1) {
+      indicators.push("High word repetition detected");
+    }
+
+    if (features.fakeWordCount > 2) {
+      indicators.push("Contains common fake review phrases");
+    }
+
+    if (features.uniqueWordRatio < 0.4) {
+      indicators.push("Low vocabulary diversity");
+    }
+
+    if (features.reviewLength < 50) {
+      indicators.push("Suspiciously short review");
+    }
+
+    if (features.reviewLength > 1000) {
+      indicators.push("Unusually long review");
+    }
+
+    if (features.avgWordLength < 3.5) {
+      indicators.push("Very simple vocabulary");
+    }
+
+    const hasGenericPhrases = FAKE_INDICATORS.some((phrase) =>
+      text.toLowerCase().includes(phrase)
+    );
+    if (hasGenericPhrases) {
+      indicators.push("Generic or promotional language detected");
+    }
+
+    if (indicators.length === 0) {
+      indicators.push("Natural language patterns");
+      indicators.push("Balanced sentiment");
+      indicators.push("Appropriate review length");
+    }
+
+    return indicators;
+  }
+}
+
+async function analyzeReview(reviewText: string): Promise<AnalysisResult> {
+  const features = FeatureExtractor.extractFeatures(reviewText);
+
+  const classifier = new FakeReviewClassifier();
+  const { verdict, confidence } = classifier.predict(features);
+
+  const indicators = classifier.explainPrediction(features, reviewText);
+
+  return {
+    verdict,
+    confidence_score: Number(confidence.toFixed(4)),
+    indicators,
+    features,
+  };
+}
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 200,
+      headers: corsHeaders,
+    });
+  }
+
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    const { reviews } = await req.json();
+
+    if (!reviews || !Array.isArray(reviews) || reviews.length === 0) {
+      return new Response(
+        JSON.stringify({ error: "Please provide an array of reviews" }),
+        {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    const results = [];
+
+    for (const reviewText of reviews) {
+      if (!reviewText || typeof reviewText !== "string" || reviewText.trim().length === 0) {
+        continue;
+      }
+
+      const analysis = await analyzeReview(reviewText);
+
+      const { error } = await supabase.from("review_analyses").insert({
+        review_text: reviewText,
+        verdict: analysis.verdict,
+        confidence_score: analysis.confidence_score,
+        indicators: analysis.indicators,
+        features: analysis.features,
+      });
+
+      if (error) {
+        console.error("Error storing analysis:", error);
+      }
+
+      results.push({
+        review: reviewText,
+        ...analysis,
+      });
+    }
+
+    return new Response(JSON.stringify({ results }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    console.error("Error analyzing reviews:", error);
+
+    return new Response(
+      JSON.stringify({ error: error.message || "Internal server error" }),
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
+  }
+});
